@@ -1,0 +1,57 @@
+name: Attach release build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the build to
+        required: true
+        default: 1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build release package
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event.release.tag_name || inputs.tag }}'
+          $version = $tag.TrimStart('v')
+          $packageName = "VisualNovelLauncher-v$version-win-x64"
+          $packageDirectory = Join-Path $PWD "artifacts/$packageName"
+          $zipPath = Join-Path $PWD "artifacts/$packageName.zip"
+
+          dotnet publish VisualNovelLauncher.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $packageDirectory
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Copy-Item LICENSE $packageDirectory/LICENSE
+          Copy-Item README.md $packageDirectory/README.md
+          Compress-Archive -Path "$packageDirectory/*" -DestinationPath $zipPath
+
+          "RELEASE_ASSET=$zipPath" >> $env:GITHUB_ENV
+
+      - name: Upload package to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload '${{ github.event.release.tag_name || inputs.tag }}' "$env:RELEASE_ASSET" --clobber
