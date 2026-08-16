@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using Microsoft.Win32;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -22,8 +24,9 @@ public sealed class AppProfile
     public string Arguments { get; set; } = "";
     public bool ChangeResolution { get; set; }
     public bool ChangeRefreshRate { get; set; } = true;
-    public int Width { get; set; } = 1920;
-    public int Height { get; set; } = 1080;
+    public bool IgnoreDpiScaling { get; set; }
+    public int Width { get; set; } = 800;
+    public int Height { get; set; } = 600;
     public int RefreshRate { get; set; } = 60;
     public int RestoreDelayMs { get; set; } = 500;
 }
@@ -69,7 +72,7 @@ public sealed class MainForm : Form
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(680, 380);
-        Size = new Size(840, 470);
+        Size = new Size(980, 470);
         Font = new Font("Segoe UI", 10F);
         AllowDrop = true;
 
@@ -95,9 +98,10 @@ public sealed class MainForm : Form
         list.MultiSelect = false;
         list.AllowDrop = true;
         list.SmallImageList = appIcons;
-        list.Columns.Add("名前", 190);
-        list.Columns.Add("表示モード", 190);
-        list.Columns.Add("アプリ", 470);
+        list.Columns.Add("名前", 180);
+        list.Columns.Add("表示モード", 250);
+        list.Columns.Add("DPIスケーリング", 190);
+        list.Columns.Add("アプリ", 420);
 
         var bottom = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 66, ColumnCount = 2, Padding = new Padding(12, 10, 12, 10) };
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -133,16 +137,18 @@ public sealed class MainForm : Form
         appIcons.Images.Clear();
         foreach (var profile in profiles)
         {
+            var launchInfo = LaunchInfo.Resolve(profile.Path, profile.Arguments);
             var mode = !profile.ChangeResolution && !profile.ChangeRefreshRate
                 ? "システム設定を使用"
                 : $"{(profile.ChangeResolution ? $"{profile.Width}×{profile.Height}" : "システムの解像度")} / "
                   + $"{(profile.ChangeRefreshRate ? $"{profile.RefreshRate} Hz" : "システムのHz")}";
-            var item = new ListViewItem([profile.Name, mode, profile.Path]);
+            var dpiMode = profile.IgnoreDpiScaling ? "無視（100%）" : $"システム設定（{DpiScaling.CurrentPercent}%）";
+            var item = new ListViewItem([profile.Name, mode, dpiMode, profile.Path]);
             try
             {
-                if (File.Exists(profile.Path))
+                if (File.Exists(launchInfo.IconPath))
                 {
-                    using var icon = Icon.ExtractAssociatedIcon(profile.Path);
+                    using var icon = Icon.ExtractAssociatedIcon(launchInfo.IconPath);
                     if (icon is not null)
                     {
                         appIcons.Images.Add(icon.ToBitmap());
@@ -172,7 +178,9 @@ public sealed class MainForm : Form
     {
         if (!e.Data!.GetDataPresent(DataFormats.FileDrop)) return [];
         return ((string[])e.Data.GetData(DataFormats.FileDrop)!)
-            .Where(path => string.Equals(System.IO.Path.GetExtension(path), ".exe", StringComparison.OrdinalIgnoreCase))
+            .Where(path =>
+                string.Equals(System.IO.Path.GetExtension(path), ".exe", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(System.IO.Path.GetExtension(path), ".lnk", StringComparison.OrdinalIgnoreCase))
             .Where(File.Exists)
             .ToArray();
     }
@@ -186,9 +194,10 @@ public sealed class MainForm : Form
     {
         foreach (var path in GetDroppedExecutables(e))
         {
+            var launchInfo = LaunchInfo.Resolve(path, "");
             var initial = new AppProfile
             {
-                Name = System.IO.Path.GetFileNameWithoutExtension(path),
+                Name = System.IO.Path.GetFileNameWithoutExtension(launchInfo.TargetPath),
                 Path = path,
                 ChangeResolution = false,
                 ChangeRefreshRate = false
@@ -235,8 +244,10 @@ public sealed class MainForm : Form
 
         running = true;
         UpdateButtons();
+        var launchInfo = LaunchInfo.Resolve(profile.Path, profile.Arguments);
         var changesDisplayMode = profile.ChangeResolution || profile.ChangeRefreshRate;
         var original = DisplayMode.GetCurrent();
+        DpiCompatibility.OverrideState? dpiOverride = null;
         try
         {
             if (changesDisplayMode)
@@ -248,15 +259,19 @@ public sealed class MainForm : Form
                     profile.ChangeRefreshRate ? profile.RefreshRate : 0);
             }
 
-            var start = new ProcessStartInfo(profile.Path)
+            if (profile.IgnoreDpiScaling)
+                dpiOverride = DpiCompatibility.ApplyIgnoreScaling(launchInfo.TargetPath);
+
+            var existingTargetPids = ProcessMonitor.CapturePids(launchInfo.TargetPath);
+            var start = new ProcessStartInfo(launchInfo.LaunchPath)
             {
-                WorkingDirectory = System.IO.Path.GetDirectoryName(profile.Path) ?? AppContext.BaseDirectory,
-                Arguments = profile.Arguments,
+                WorkingDirectory = launchInfo.WorkingDirectory,
+                Arguments = launchInfo.Arguments,
                 UseShellExecute = true
             };
             using var process = Process.Start(start) ?? throw new InvalidOperationException("プロセスを開始できませんでした。");
             status.Text = $"{profile.Name} を実行中";
-            await process.WaitForExitAsync();
+            await ProcessMonitor.WaitForTargetAsync(launchInfo.TargetPath, existingTargetPids, process);
         }
         catch (Exception ex)
         {
@@ -264,6 +279,7 @@ public sealed class MainForm : Form
         }
         finally
         {
+            dpiOverride?.Restore();
             if (changesDisplayMode)
             {
                 status.Text = "元の表示モードへ戻しています…";
@@ -294,8 +310,10 @@ public sealed class ProfileDialog : Form
     private readonly TextBox argumentsBox = new();
     private readonly CheckBox resolutionCheck = new() { Text = "解像度を変更する", AutoSize = true };
     private readonly CheckBox refreshRateCheck = new() { Text = "リフレッシュレートを変更する", Checked = false, AutoSize = true };
-    private readonly NumericUpDown widthBox = new() { Minimum = 320, Maximum = 16384, Value = 1920 };
-    private readonly NumericUpDown heightBox = new() { Minimum = 200, Maximum = 16384, Value = 1080 };
+    private readonly RadioButton systemDpiRadio = new() { AutoSize = true };
+    private readonly RadioButton ignoreDpiRadio = new() { Text = "スケーリングを無視（100%）", AutoSize = true };
+    private readonly NumericUpDown widthBox = new() { Minimum = 320, Maximum = 16384, Value = 800 };
+    private readonly NumericUpDown heightBox = new() { Minimum = 200, Maximum = 16384, Value = 600 };
     private readonly NumericUpDown hzBox = new() { Minimum = 23, Maximum = 1000, Value = 60 };
     private readonly NumericUpDown delayBox = new() { Minimum = 0, Maximum = 10000, Increment = 100, Value = 500 };
     private readonly PictureBox iconPreview = new() { Size = new Size(36, 36), SizeMode = PictureBoxSizeMode.CenterImage, Margin = new Padding(8, 2, 0, 0) };
@@ -311,7 +329,7 @@ public sealed class ProfileDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         MinimumSize = new Size(650, 460);
-        ClientSize = new Size(720, 520);
+        ClientSize = new Size(720, 570);
         Font = new Font("Segoe UI", 10F);
         BuildUi();
 
@@ -320,7 +338,13 @@ public sealed class ProfileDialog : Form
             nameBox.Text = source.Name; pathBox.Text = source.Path; argumentsBox.Text = source.Arguments;
             resolutionCheck.Checked = source.ChangeResolution; widthBox.Value = source.Width; heightBox.Value = source.Height;
             refreshRateCheck.Checked = source.ChangeRefreshRate;
+            ignoreDpiRadio.Checked = source.IgnoreDpiScaling;
+            systemDpiRadio.Checked = !source.IgnoreDpiScaling;
             hzBox.Value = source.RefreshRate; delayBox.Value = source.RestoreDelayMs;
+        }
+        else
+        {
+            systemDpiRadio.Checked = true;
         }
         UpdateResolutionFields();
         UpdateRefreshRateField();
@@ -328,11 +352,11 @@ public sealed class ProfileDialog : Form
 
     private void BuildUi()
     {
-        var table = new TableLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(16), ColumnCount = 3, RowCount = 9 };
+        var table = new TableLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(16), ColumnCount = 3, RowCount = 10 };
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 165));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145));
-        for (var i = 0; i < 8; i++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        for (var i = 0; i < 9; i++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         table.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
 
         AddRow(table, 0, "名前", nameBox);
@@ -353,13 +377,19 @@ public sealed class ProfileDialog : Form
         table.Controls.Add(refreshRateCheck, 1, 5);
         table.SetColumnSpan(refreshRateCheck, 2);
         AddRow(table, 6, "リフレッシュレート", hzBox);
-        AddRow(table, 7, "復帰待機 (ms)", delayBox);
+        systemDpiRadio.Text = $"システム設定を使用（{DpiScaling.CurrentPercent}%）";
+        var dpiPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+        dpiPanel.Controls.Add(systemDpiRadio);
+        dpiPanel.Controls.Add(ignoreDpiRadio);
+        AddRow(table, 7, "DPIスケーリング", dpiPanel);
+        table.SetColumnSpan(dpiPanel, 2);
+        AddRow(table, 8, "復帰待機 (ms)", delayBox);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 4) };
         var ok = new Button { Text = "保存", Width = 100, Height = 34, DialogResult = DialogResult.None };
         var cancel = new Button { Text = "キャンセル", Width = 110, Height = 34, DialogResult = DialogResult.Cancel };
         buttons.Controls.Add(ok); buttons.Controls.Add(cancel);
-        table.Controls.Add(buttons, 0, 8); table.SetColumnSpan(buttons, 3);
+        table.Controls.Add(buttons, 0, 9); table.SetColumnSpan(buttons, 3);
         Controls.Add(table);
 
         browse.Click += (_, _) => Browse();
@@ -383,10 +413,11 @@ public sealed class ProfileDialog : Form
 
     private void Browse()
     {
-        using var dialog = new OpenFileDialog { Filter = "Applications (*.exe)|*.exe|All files (*.*)|*.*" };
+        using var dialog = new OpenFileDialog { Filter = "Applications and shortcuts (*.exe;*.lnk)|*.exe;*.lnk|All files (*.*)|*.*" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         pathBox.Text = dialog.FileName;
-        if (string.IsNullOrWhiteSpace(nameBox.Text)) nameBox.Text = System.IO.Path.GetFileNameWithoutExtension(dialog.FileName);
+        if (string.IsNullOrWhiteSpace(nameBox.Text))
+            nameBox.Text = System.IO.Path.GetFileNameWithoutExtension(LaunchInfo.Resolve(dialog.FileName, "").TargetPath);
     }
 
     private void UpdateIconPreview()
@@ -397,7 +428,7 @@ public sealed class ProfileDialog : Form
         try
         {
             if (!File.Exists(pathBox.Text)) return;
-            using var icon = Icon.ExtractAssociatedIcon(pathBox.Text);
+            using var icon = Icon.ExtractAssociatedIcon(LaunchInfo.Resolve(pathBox.Text, argumentsBox.Text).IconPath);
             if (icon is not null) iconPreview.Image = icon.ToBitmap();
         }
         catch { }
@@ -406,7 +437,7 @@ public sealed class ProfileDialog : Form
     private void UpdateDefaultName()
     {
         if (!string.IsNullOrWhiteSpace(nameBox.Text) || !File.Exists(pathBox.Text)) return;
-        nameBox.Text = System.IO.Path.GetFileNameWithoutExtension(pathBox.Text);
+        nameBox.Text = System.IO.Path.GetFileNameWithoutExtension(LaunchInfo.Resolve(pathBox.Text, argumentsBox.Text).TargetPath);
     }
 
     private void UpdateResolutionFields() => widthBox.Enabled = heightBox.Enabled = resolutionCheck.Checked;
@@ -424,10 +455,242 @@ public sealed class ProfileDialog : Form
         {
             Name = nameBox.Text.Trim(), Path = pathBox.Text.Trim(), Arguments = argumentsBox.Text,
             ChangeResolution = resolutionCheck.Checked, Width = (int)widthBox.Value, Height = (int)heightBox.Value,
-            ChangeRefreshRate = refreshRateCheck.Checked, RefreshRate = (int)hzBox.Value, RestoreDelayMs = (int)delayBox.Value
+            ChangeRefreshRate = refreshRateCheck.Checked, RefreshRate = (int)hzBox.Value,
+            IgnoreDpiScaling = ignoreDpiRadio.Checked, RestoreDelayMs = (int)delayBox.Value
         };
         DialogResult = DialogResult.OK;
         Close();
+    }
+}
+
+internal sealed class LaunchInfo
+{
+    public required string LaunchPath { get; init; }
+    public required string TargetPath { get; init; }
+    public required string Arguments { get; init; }
+    public required string WorkingDirectory { get; init; }
+    public required string IconPath { get; init; }
+
+    public static LaunchInfo Resolve(string path, string additionalArguments)
+    {
+        var fullPath = System.IO.Path.GetFullPath(path);
+        var defaultDirectory = System.IO.Path.GetDirectoryName(fullPath) ?? AppContext.BaseDirectory;
+        if (!string.Equals(System.IO.Path.GetExtension(fullPath), ".lnk", StringComparison.OrdinalIgnoreCase))
+        {
+            return new LaunchInfo
+            {
+                LaunchPath = fullPath,
+                TargetPath = fullPath,
+                Arguments = additionalArguments,
+                WorkingDirectory = defaultDirectory,
+                IconPath = fullPath
+            };
+        }
+
+        try
+        {
+            var shortcut = ShortcutInfo.Read(fullPath);
+            var workingDirectory = Directory.Exists(shortcut.WorkingDirectory)
+                ? shortcut.WorkingDirectory
+                : System.IO.Path.GetDirectoryName(shortcut.TargetPath) ?? defaultDirectory;
+            var targetPath = FindExecutableArgument(shortcut.Arguments, workingDirectory) ?? shortcut.TargetPath;
+            return new LaunchInfo
+            {
+                LaunchPath = shortcut.TargetPath,
+                TargetPath = targetPath,
+                Arguments = JoinArguments(shortcut.Arguments, additionalArguments),
+                WorkingDirectory = workingDirectory,
+                IconPath = File.Exists(targetPath) ? targetPath : shortcut.TargetPath
+            };
+        }
+        catch
+        {
+            return new LaunchInfo
+            {
+                LaunchPath = fullPath,
+                TargetPath = fullPath,
+                Arguments = additionalArguments,
+                WorkingDirectory = defaultDirectory,
+                IconPath = fullPath
+            };
+        }
+    }
+
+    private static string JoinArguments(string first, string second) =>
+        string.Join(" ", new[] { first, second }.Where(value => !string.IsNullOrWhiteSpace(value)));
+
+    private static string? FindExecutableArgument(string arguments, string baseDirectory)
+    {
+        foreach (var argument in CommandLineArguments.Parse(arguments))
+        {
+            if (!string.Equals(System.IO.Path.GetExtension(argument), ".exe", StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                var candidate = System.IO.Path.IsPathRooted(argument)
+                    ? argument
+                    : System.IO.Path.Combine(baseDirectory, argument);
+                candidate = System.IO.Path.GetFullPath(candidate);
+                if (File.Exists(candidate)) return candidate;
+            }
+            catch { }
+        }
+        return null;
+    }
+}
+
+internal sealed class ShortcutInfo
+{
+    public required string TargetPath { get; init; }
+    public required string Arguments { get; init; }
+    public required string WorkingDirectory { get; init; }
+
+    public static ShortcutInfo Read(string path)
+    {
+        var shellType = Type.GetTypeFromProgID("WScript.Shell") ?? throw new InvalidOperationException("ショートカットを解析できません。");
+        object? shell = null;
+        object? shortcut = null;
+        try
+        {
+            shell = Activator.CreateInstance(shellType);
+            shortcut = shellType.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, [path]);
+            var shortcutType = shortcut!.GetType();
+            string Get(string name) => shortcutType.InvokeMember(name, BindingFlags.GetProperty, null, shortcut, null) as string ?? "";
+            var targetPath = Get("TargetPath");
+            if (!File.Exists(targetPath)) throw new FileNotFoundException("ショートカットのリンク先が見つかりません。", targetPath);
+            return new ShortcutInfo { TargetPath = targetPath, Arguments = Get("Arguments"), WorkingDirectory = Get("WorkingDirectory") };
+        }
+        finally
+        {
+            if (shortcut is not null && Marshal.IsComObject(shortcut)) Marshal.FinalReleaseComObject(shortcut);
+            if (shell is not null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
+        }
+    }
+}
+
+internal static class CommandLineArguments
+{
+    [DllImport("shell32.dll", SetLastError = true)]
+    private static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string commandLine, out int argumentCount);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    public static string[] Parse(string arguments)
+    {
+        if (string.IsNullOrWhiteSpace(arguments)) return [];
+        var pointer = CommandLineToArgvW("launcher.exe " + arguments, out var count);
+        if (pointer == IntPtr.Zero) return [];
+        try
+        {
+            var result = new string[Math.Max(0, count - 1)];
+            for (var i = 1; i < count; i++)
+                result[i - 1] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(pointer, i * IntPtr.Size)) ?? "";
+            return result;
+        }
+        finally { LocalFree(pointer); }
+    }
+}
+
+internal static class ProcessMonitor
+{
+    public static HashSet<int> CapturePids(string executablePath) => FindProcesses(executablePath).Select(process =>
+    {
+        var id = process.Id;
+        process.Dispose();
+        return id;
+    }).ToHashSet();
+
+    public static async Task WaitForTargetAsync(string targetPath, HashSet<int> existingPids, Process launchedProcess)
+    {
+        DateTime? launcherExitTime = null;
+        while (true)
+        {
+            var processes = FindProcesses(targetPath);
+            var target = processes.FirstOrDefault(process => !existingPids.Contains(process.Id));
+            foreach (var process in processes)
+                if (!ReferenceEquals(process, target)) process.Dispose();
+            if (target is not null)
+            {
+                using (target) await target.WaitForExitAsync();
+                return;
+            }
+
+            if (launchedProcess.HasExited)
+            {
+                launcherExitTime ??= DateTime.UtcNow;
+                if (DateTime.UtcNow - launcherExitTime >= TimeSpan.FromSeconds(10)) return;
+            }
+            await Task.Delay(250);
+        }
+    }
+
+    private static List<Process> FindProcesses(string executablePath)
+    {
+        var expected = System.IO.Path.GetFullPath(executablePath);
+        var matches = new List<Process>();
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                if (string.Equals(process.MainModule?.FileName, expected, StringComparison.OrdinalIgnoreCase))
+                    matches.Add(process);
+                else
+                    process.Dispose();
+            }
+            catch { process.Dispose(); }
+        }
+        return matches;
+    }
+}
+
+internal static class DpiScaling
+{
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForSystem();
+
+    public static int CurrentPercent
+    {
+        get
+        {
+            try { return (int)Math.Round(GetDpiForSystem() * 100.0 / 96.0); }
+            catch { return 100; }
+        }
+    }
+}
+
+internal static class DpiCompatibility
+{
+    private const string LayersKey = @"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers";
+
+    public sealed class OverrideState
+    {
+        private readonly string path;
+        private readonly object? previousValue;
+
+        internal OverrideState(string path, object? previousValue)
+        {
+            this.path = path;
+            this.previousValue = previousValue;
+        }
+
+        public void Restore()
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(LayersKey);
+            if (previousValue is null)
+                key.DeleteValue(path, false);
+            else
+                key.SetValue(path, previousValue, RegistryValueKind.String);
+        }
+    }
+
+    public static OverrideState ApplyIgnoreScaling(string path)
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(LayersKey);
+        var previousValue = key.GetValue(path);
+        var layers = previousValue as string ?? "~";
+        if (!layers.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains("HIGHDPIAWARE", StringComparer.OrdinalIgnoreCase))
+            layers += " HIGHDPIAWARE";
+        key.SetValue(path, layers.Trim(), RegistryValueKind.String);
+        return new OverrideState(path, previousValue);
     }
 }
 
