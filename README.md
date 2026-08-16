@@ -33,19 +33,19 @@
 
 ## ビルド
 
-.NET 8 SDKを使用します。
+開発用（.NET 8 SDKを利用）：
 
 ```powershell
 dotnet build VisualNovelLauncher.csproj -c Release
 ```
 
-フレームワーク依存版の発行：
+軽量版（Github Releaseではこれを利用・利用環境に.NET 8が必要）：
 
 ```powershell
 dotnet publish VisualNovelLauncher.csproj -c Release -r win-x64 --self-contained false -o publish
 ```
 
-自己完結版の発行：
+スタンドアロン版（.NET 8を同梱）：
 
 ```powershell
 dotnet publish VisualNovelLauncher.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
