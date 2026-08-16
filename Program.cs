@@ -21,6 +21,7 @@ public sealed class AppProfile
     public string Path { get; set; } = "";
     public string Arguments { get; set; } = "";
     public bool ChangeResolution { get; set; }
+    public bool ChangeRefreshRate { get; set; } = true;
     public int Width { get; set; } = 1920;
     public int Height { get; set; } = 1080;
     public int RefreshRate { get; set; } = 60;
@@ -132,9 +133,10 @@ public sealed class MainForm : Form
         appIcons.Images.Clear();
         foreach (var profile in profiles)
         {
-            var mode = profile.ChangeResolution
-                ? $"{profile.Width}×{profile.Height} / {profile.RefreshRate} Hz"
-                : $"解像度維持 / {profile.RefreshRate} Hz";
+            var mode = !profile.ChangeResolution && !profile.ChangeRefreshRate
+                ? "システム設定を使用"
+                : $"{(profile.ChangeResolution ? $"{profile.Width}×{profile.Height}" : "システムの解像度")} / "
+                  + $"{(profile.ChangeRefreshRate ? $"{profile.RefreshRate} Hz" : "システムのHz")}";
             var item = new ListViewItem([profile.Name, mode, profile.Path]);
             try
             {
@@ -184,7 +186,13 @@ public sealed class MainForm : Form
     {
         foreach (var path in GetDroppedExecutables(e))
         {
-            var initial = new AppProfile { Name = System.IO.Path.GetFileNameWithoutExtension(path), Path = path };
+            var initial = new AppProfile
+            {
+                Name = System.IO.Path.GetFileNameWithoutExtension(path),
+                Path = path,
+                ChangeResolution = false,
+                ChangeRefreshRate = false
+            };
             using var dialog = new ProfileDialog(initial);
             if (dialog.ShowDialog(this) != DialogResult.OK) continue;
             profiles.Add(dialog.Profile);
@@ -227,11 +235,18 @@ public sealed class MainForm : Form
 
         running = true;
         UpdateButtons();
+        var changesDisplayMode = profile.ChangeResolution || profile.ChangeRefreshRate;
         var original = DisplayMode.GetCurrent();
         try
         {
-            status.Text = $"{profile.RefreshRate} Hzへ切り替えています…";
-            DisplayMode.ChangeTo(profile.ChangeResolution ? profile.Width : 0, profile.ChangeResolution ? profile.Height : 0, profile.RefreshRate);
+            if (changesDisplayMode)
+            {
+                status.Text = "表示モードを切り替えています…";
+                DisplayMode.ChangeTo(
+                    profile.ChangeResolution ? profile.Width : 0,
+                    profile.ChangeResolution ? profile.Height : 0,
+                    profile.ChangeRefreshRate ? profile.RefreshRate : 0);
+            }
 
             var start = new ProcessStartInfo(profile.Path)
             {
@@ -249,10 +264,13 @@ public sealed class MainForm : Form
         }
         finally
         {
-            status.Text = "元の表示モードへ戻しています…";
-            if (profile.RestoreDelayMs > 0) await Task.Delay(profile.RestoreDelayMs);
-            try { DisplayMode.Restore(original); }
-            catch (Exception ex) { MessageBox.Show(ex.Message, "復帰エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            if (changesDisplayMode)
+            {
+                status.Text = "元の表示モードへ戻しています…";
+                if (profile.RestoreDelayMs > 0) await Task.Delay(profile.RestoreDelayMs);
+                try { DisplayMode.Restore(original); }
+                catch (Exception ex) { MessageBox.Show(ex.Message, "復帰エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            }
             running = false;
             status.Text = "完了";
             UpdateButtons();
@@ -274,7 +292,8 @@ public sealed class ProfileDialog : Form
     private readonly TextBox nameBox = new();
     private readonly TextBox pathBox = new();
     private readonly TextBox argumentsBox = new();
-    private readonly CheckBox resolutionCheck = new() { Text = "解像度も変更する" };
+    private readonly CheckBox resolutionCheck = new() { Text = "解像度を変更する", AutoSize = true };
+    private readonly CheckBox refreshRateCheck = new() { Text = "リフレッシュレートを変更する", Checked = false, AutoSize = true };
     private readonly NumericUpDown widthBox = new() { Minimum = 320, Maximum = 16384, Value = 1920 };
     private readonly NumericUpDown heightBox = new() { Minimum = 200, Maximum = 16384, Value = 1080 };
     private readonly NumericUpDown hzBox = new() { Minimum = 23, Maximum = 1000, Value = 60 };
@@ -292,7 +311,7 @@ public sealed class ProfileDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         MinimumSize = new Size(650, 460);
-        ClientSize = new Size(720, 470);
+        ClientSize = new Size(720, 520);
         Font = new Font("Segoe UI", 10F);
         BuildUi();
 
@@ -300,18 +319,20 @@ public sealed class ProfileDialog : Form
         {
             nameBox.Text = source.Name; pathBox.Text = source.Path; argumentsBox.Text = source.Arguments;
             resolutionCheck.Checked = source.ChangeResolution; widthBox.Value = source.Width; heightBox.Value = source.Height;
+            refreshRateCheck.Checked = source.ChangeRefreshRate;
             hzBox.Value = source.RefreshRate; delayBox.Value = source.RestoreDelayMs;
         }
         UpdateResolutionFields();
+        UpdateRefreshRateField();
     }
 
     private void BuildUi()
     {
-        var table = new TableLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(16), ColumnCount = 3, RowCount = 8 };
+        var table = new TableLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(16), ColumnCount = 3, RowCount = 9 };
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 165));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145));
-        for (var i = 0; i < 7; i++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        for (var i = 0; i < 8; i++) table.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         table.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
 
         AddRow(table, 0, "名前", nameBox);
@@ -323,19 +344,22 @@ public sealed class ProfileDialog : Form
         table.Controls.Add(pathActions, 2, 1);
         AddRow(table, 2, "引数", argumentsBox);
         table.Controls.Add(resolutionCheck, 1, 3);
+        table.SetColumnSpan(resolutionCheck, 2);
 
         var resolutionPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
         widthBox.Width = 100; heightBox.Width = 100;
         resolutionPanel.Controls.Add(widthBox); resolutionPanel.Controls.Add(new Label { Text = "×", AutoSize = true, Margin = new Padding(8, 7, 8, 0) }); resolutionPanel.Controls.Add(heightBox);
         AddRow(table, 4, "解像度", resolutionPanel);
-        AddRow(table, 5, "リフレッシュレート", hzBox);
-        AddRow(table, 6, "復帰待機 (ms)", delayBox);
+        table.Controls.Add(refreshRateCheck, 1, 5);
+        table.SetColumnSpan(refreshRateCheck, 2);
+        AddRow(table, 6, "リフレッシュレート", hzBox);
+        AddRow(table, 7, "復帰待機 (ms)", delayBox);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 4) };
         var ok = new Button { Text = "保存", Width = 100, Height = 34, DialogResult = DialogResult.None };
         var cancel = new Button { Text = "キャンセル", Width = 110, Height = 34, DialogResult = DialogResult.Cancel };
         buttons.Controls.Add(ok); buttons.Controls.Add(cancel);
-        table.Controls.Add(buttons, 0, 7); table.SetColumnSpan(buttons, 3);
+        table.Controls.Add(buttons, 0, 8); table.SetColumnSpan(buttons, 3);
         Controls.Add(table);
 
         browse.Click += (_, _) => Browse();
@@ -345,6 +369,7 @@ public sealed class ProfileDialog : Form
             UpdateIconPreview();
         };
         resolutionCheck.CheckedChanged += (_, _) => UpdateResolutionFields();
+        refreshRateCheck.CheckedChanged += (_, _) => UpdateRefreshRateField();
         ok.Click += (_, _) => SaveAndClose();
         AcceptButton = ok; CancelButton = cancel;
     }
@@ -386,6 +411,8 @@ public sealed class ProfileDialog : Form
 
     private void UpdateResolutionFields() => widthBox.Enabled = heightBox.Enabled = resolutionCheck.Checked;
 
+    private void UpdateRefreshRateField() => hzBox.Enabled = refreshRateCheck.Checked;
+
     private void SaveAndClose()
     {
         if (string.IsNullOrWhiteSpace(nameBox.Text) || !File.Exists(pathBox.Text))
@@ -397,7 +424,7 @@ public sealed class ProfileDialog : Form
         {
             Name = nameBox.Text.Trim(), Path = pathBox.Text.Trim(), Arguments = argumentsBox.Text,
             ChangeResolution = resolutionCheck.Checked, Width = (int)widthBox.Value, Height = (int)heightBox.Value,
-            RefreshRate = (int)hzBox.Value, RestoreDelayMs = (int)delayBox.Value
+            ChangeRefreshRate = refreshRateCheck.Checked, RefreshRate = (int)hzBox.Value, RestoreDelayMs = (int)delayBox.Value
         };
         DialogResult = DialogResult.OK;
         Close();
@@ -432,9 +459,9 @@ internal static class DisplayMode
     public static void ChangeTo(int width, int height, int hz)
     {
         var mode = GetCurrent();
-        mode.Fields = 0x00400000;
+        mode.Fields = 0;
         if (width > 0 && height > 0) { mode.Fields |= 0x00080000 | 0x00100000; mode.PelsWidth = width; mode.PelsHeight = height; }
-        mode.DisplayFrequency = hz;
+        if (hz > 0) { mode.Fields |= 0x00400000; mode.DisplayFrequency = hz; }
         var result = ChangeDisplaySettings(ref mode, 0);
         if (result != 0) throw new InvalidOperationException($"表示モードを変更できません (code {result})。");
     }
