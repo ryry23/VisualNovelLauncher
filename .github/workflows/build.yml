@@ -1,0 +1,28 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build
+        run: dotnet build VisualNovelLauncher.csproj -c Release
+      - name: Publish
+        run: dotnet publish VisualNovelLauncher.csproj -c Release -r win-x64 --self-contained false -o publish
+      - name: Include documentation
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE publish/LICENSE
+          Copy-Item README.md publish/README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VisualNovelLauncher-win-x64
+          path: publish/
+
