@@ -22,7 +22,7 @@
 
 ## 使い方
 
-1. [Releases](../../releases/latest)から最新版ZIPをダウンロードします。
+1. [Releases](https://github.com/ryry23/VisualNovelLauncher/releases)から最新版ZIPをダウンロードします。
 2. ZIPを任意のフォルダへ展開します。
 3. `VisualNovelLauncher.exe`を起動します。
 4. `+`ボタン、またはEXEのドラッグ＆ドロップでゲームを登録します。
