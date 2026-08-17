@@ -61,6 +61,8 @@ public sealed class MainForm : Form
     private readonly Button addButton = new() { Text = "+", Width = 44, Height = 34 };
     private readonly Button removeButton = new() { Text = "−", Width = 44, Height = 34 };
     private readonly Button editButton = new() { Text = "編集", Width = 74, Height = 34 };
+    private readonly Button moveUpButton = new() { Text = "↑", Width = 44, Height = 34 };
+    private readonly Button moveDownButton = new() { Text = "↓", Width = 44, Height = 34 };
     private readonly Button launchButton = new() { Text = "起動", Width = 100, Height = 34 };
     private readonly Label status = new() { AutoSize = true, Text = "アプリを選択してください" };
     private readonly List<AppProfile> profiles;
@@ -90,6 +92,8 @@ public sealed class MainForm : Form
         top.Controls.Add(addButton);
         top.Controls.Add(removeButton);
         top.Controls.Add(editButton);
+        top.Controls.Add(moveUpButton);
+        top.Controls.Add(moveDownButton);
 
         list.Dock = DockStyle.Fill;
         list.View = View.Details;
@@ -117,6 +121,8 @@ public sealed class MainForm : Form
         addButton.Click += (_, _) => AddProfile();
         removeButton.Click += (_, _) => RemoveProfile();
         editButton.Click += (_, _) => EditProfile();
+        moveUpButton.Click += (_, _) => MoveProfile(-1);
+        moveDownButton.Click += (_, _) => MoveProfile(1);
         launchButton.Click += async (_, _) => await LaunchSelectedAsync();
         list.DoubleClick += async (_, _) => await LaunchSelectedAsync();
         list.SelectedIndexChanged += (_, _) => UpdateButtons();
@@ -161,8 +167,18 @@ public sealed class MainForm : Form
         }
         list.EndUpdate();
         if (selectIndex >= 0 && selectIndex < list.Items.Count)
-            list.Items[selectIndex].Selected = true;
+            SelectAndFocus(selectIndex);
         UpdateButtons();
+    }
+
+    private void SelectAndFocus(int index)
+    {
+        if (index < 0 || index >= list.Items.Count) return;
+        list.SelectedIndices.Clear();
+        list.Items[index].Selected = true;
+        list.Items[index].Focused = true;
+        list.EnsureVisible(index);
+        list.Select();
     }
 
     private void AddProfile()
@@ -192,6 +208,7 @@ public sealed class MainForm : Form
 
     private void HandleDragDrop(object? sender, DragEventArgs e)
     {
+        var addedIndex = -1;
         foreach (var path in GetDroppedExecutables(e))
         {
             var launchInfo = LaunchInfo.Resolve(path, "");
@@ -205,9 +222,11 @@ public sealed class MainForm : Form
             using var dialog = new ProfileDialog(initial);
             if (dialog.ShowDialog(this) != DialogResult.OK) continue;
             profiles.Add(dialog.Profile);
+            addedIndex = profiles.Count - 1;
         }
+        if (addedIndex < 0) return;
         ProfileStore.Save(profiles);
-        RefreshList(profiles.Count - 1);
+        RefreshList(addedIndex);
     }
 
     private void EditProfile()
@@ -230,6 +249,18 @@ public sealed class MainForm : Form
         profiles.RemoveAt(list.SelectedIndices[0]);
         ProfileStore.Save(profiles);
         RefreshList();
+    }
+
+    private void MoveProfile(int offset)
+    {
+        if (running || list.SelectedIndices.Count != 1) return;
+        var index = list.SelectedIndices[0];
+        var destination = index + offset;
+        if (destination < 0 || destination >= profiles.Count) return;
+        (profiles[index], profiles[destination]) = (profiles[destination], profiles[index]);
+        ProfileStore.Save(profiles);
+        RefreshList(destination);
+        list.EnsureVisible(destination);
     }
 
     private async Task LaunchSelectedAsync()
@@ -288,7 +319,7 @@ public sealed class MainForm : Form
                 catch (Exception ex) { MessageBox.Show(ex.Message, "復帰エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
             }
             running = false;
-            status.Text = "完了";
+            status.Text = "アプリを選択してください";
             UpdateButtons();
         }
     }
@@ -299,6 +330,9 @@ public sealed class MainForm : Form
         addButton.Enabled = !running;
         removeButton.Enabled = selected && !running;
         editButton.Enabled = selected && !running;
+        var selectedIndex = selected ? list.SelectedIndices[0] : -1;
+        moveUpButton.Enabled = selected && !running && selectedIndex > 0;
+        moveDownButton.Enabled = selected && !running && selectedIndex < profiles.Count - 1;
         launchButton.Enabled = selected && !running;
     }
 }
